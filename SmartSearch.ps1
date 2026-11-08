@@ -1,221 +1,285 @@
-# ==============================================================================
-#  SmartSearch v5.1.0 - Native Windows Desktop App (PowerShell + WPF)
-#  Search, deduplicate and purge local storage - fully offline, no HTML.
-#  Simplified settings · No auto-open · Hardened
-# ==============================================================================
-$Version = '5.1.0'
-$ErrorActionPreference = 'Continue'
-$PSScriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+# ============================================================================
+# SmartSearch v5.1.1 - Native Windows desktop app (PowerShell + WPF)
+# Offline file search and safe duplicate detection/removal.
+# ============================================================================
+$Version = '5.1.1'
+$ErrorActionPreference = 'Stop'
+
+if (-not $PSScriptRoot) {
+    $PSScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+}
 $AppDir = $PSScriptRoot
 $SettingsPath = Join-Path $AppDir 'SmartSearchSettings.json'
-$PresetDir = Join-Path $env:LOCALAPPDATA 'SmartSearch'
-if (-not (Test-Path $PresetDir)) { New-Item -ItemType Directory -Path $PresetDir -Force | Out-Null }
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
-Add-Type -AssemblyName Microsoft.VisualBasic
 Add-Type -AssemblyName System.Windows.Forms
 
-# ---------------------------------------------------------------------------
-#  XAML UI
-# ---------------------------------------------------------------------------
-$XamlText = @'
-<Window
-        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+function Get-DefaultSettings {
+    [pscustomobject]@{
+        SearchRoot        = [Environment]::GetFolderPath('UserProfile')
+        SearchText        = ''
+        IncludeSubfolders = $true
+        Exclusions        = @('AppData', 'node_modules', '.git', '$RECYCLE.BIN', 'Temporary Internet Files')
+    }
+}
+
+function Get-AppSettings {
+    $settings = Get-DefaultSettings
+    if (Test-Path -LiteralPath $SettingsPath -PathType Leaf) {
+        try {
+            $saved = Get-Content -LiteralPath $SettingsPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            foreach ($name in @('SearchRoot', 'SearchText', 'IncludeSubfolders', 'Exclusions')) {
+                if ($null -ne $saved.PSObject.Properties[$name]) {
+                    $settings.$name = $saved.$name
+                }
+            }
+        }
+        catch {
+            # Keep defaults if the settings file is missing fields or invalid JSON.
+        }
+    }
+    return $settings
+}
+
+function Save-AppSettings {
+    param([Parameter(Mandatory)]$Settings)
+    $Settings | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $SettingsPath -Encoding UTF8
+}
+
+function Test-ExcludedPath {
+    param([string]$Path, [string[]]$Exclusions = @())
+    if (-not $Exclusions) { return $false }
+    foreach ($segment in ($Path -split '[\\/]')) {
+        foreach ($excluded in $Exclusions) {
+            if (-not [string]::IsNullOrWhiteSpace($excluded) -and
+                [string]::Equals($segment, $excluded, [StringComparison]::OrdinalIgnoreCase)) {
+                return $true
+            }
+        }
+    }
+    return $false
+}
+
+function Find-LocalFiles {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [string]$SearchText = '',
+        [bool]$IncludeSubfolders = $true,
+        [string[]]$Exclusions = @(),
+        [ValidateRange(1, 100000)][int]$MaxResults = 5000
+    )
+
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
+        throw "The selected folder does not exist: $Root"
+    }
+    $options = @{ LiteralPath = $Root; File = $true; ErrorAction = 'SilentlyContinue' }
+    if ($IncludeSubfolders) { $options.Recurse = $true }
+    $query = $SearchText.Trim()
+    $found = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($file in (Get-ChildItem @options)) {
+        if (Test-ExcludedPath -Path $file.FullName -Exclusions $Exclusions) { continue }
+        if ($query -and $file.Name.IndexOf($query, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+        $found.Add([pscustomobject]@{
+            Name = $file.Name
+            FullName = $file.FullName
+            Length = [long]$file.Length
+            Display = ('{0}  |  {1}  |  {2:N1} KB' -f $file.Name, $file.FullName, ($file.Length / 1KB))
+        })
+        if ($found.Count -ge $MaxResults) { break }
+    }
+    return ,$found.ToArray()
+}
+
+function Get-ConfirmedDuplicateFiles {
+    param([Parameter(Mandatory)][object[]]$Files)
+    # File size alone cannot establish that two files are duplicates; compare SHA-256.
+    $seen = @{}
+    $duplicates = [System.Collections.Generic.List[object]]::new()
+    foreach ($file in $Files) {
+        try {
+            if (-not (Test-Path -LiteralPath $file.FullName -PathType Leaf)) { continue }
+            $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
+            if ($seen.ContainsKey($hash)) { $duplicates.Add($file) }
+            else { $seen[$hash] = $file.FullName }
+        }
+        catch {
+            # Skip files that became inaccessible during the scan.
+        }
+    }
+    return ,$duplicates.ToArray()
+}
+
+function Start-SmartSearch {
+    $xaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="SmartSearch"
-        Width="920" Height="760"
-        Foreground="#E7F5EB"
-        WindowStartupLocation="CenterScreen"
-        FontFamily="Segoe UI"
-        TextOptions.TextFormattingMode="Display"
-        UseLayoutRounding="True">
-    <Window.Background>
-        <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
-            <GradientStop Color="#0B0F0D" Offset="0"/>
-            <GradientStop Color="#050806" Offset="1"/>
-        </LinearGradientBrush>
-    </Window.Background>
+        Title="SmartSearch" Width="980" Height="720" MinWidth="720" MinHeight="520"
+        WindowStartupLocation="CenterScreen" Background="#080D0A" Foreground="#E7F5EB"
+        FontFamily="Segoe UI" UseLayoutRounding="True">
     <Window.Resources>
-        <LinearGradientBrush x:Key="BtnGrad" StartPoint="0,0" EndPoint="1,1">
-            <GradientStop Color="#16A34A" Offset="0"/>
-            <GradientStop Color="#22C55E" Offset="1"/>
-        </LinearGradientBrush>
-        <LinearGradientBrush x:Key="BtnGradHover" StartPoint="0,0" EndPoint="1,1">
-            <GradientStop Color="#22C55E" Offset="0"/>
-            <GradientStop Color="#15803D" Offset="1"/>
-        </LinearGradientBrush>
-        <LinearGradientBrush x:Key="Accent" StartPoint="0,0" EndPoint="1,0">
-            <GradientStop Color="#16A34A" Offset="0"/>
-            <GradientStop Color="#34D399" Offset="0.55"/>
-            <GradientStop Color="#22C55E" Offset="1"/>
-        </LinearGradientBrush>
-        <LinearGradientBrush x:Key="IconTile" StartPoint="0,0" EndPoint="1,1">
-            <GradientStop Color="#4ADE80" Offset="0"/>
-            <GradientStop Color="#22C55E" Offset="1"/>
-        </LinearGradientBrush>
-        <DropShadowEffect x:Key="CardShadow" BlurRadius="24" ShadowDepth="5" Direction="270" Opacity="0.16" Color="#000000"/>
-        <DropShadowEffect x:Key="SoftShadow" BlurRadius="14" ShadowDepth="2" Direction="270" Opacity="0.12" Color="#000000"/>
-        <DropShadowEffect x:Key="BtnShadow" BlurRadius="14" ShadowDepth="4" Direction="270" Opacity="0.35" Color="#15803D"/>
-        <DropShadowEffect x:Key="Glow" BlurRadius="7" ShadowDepth="0" Opacity="0.30" Color="#22C55E"/>
-        <Style x:Key="InputBox" TargetType="TextBox">
-            <Setter Property="Height" Value="34"/>
-            <Setter Property="Padding" Value="10,5"/>
-            <Setter Property="FontSize" Value="13"/>
-            <Setter Property="Foreground" Value="#E7F5EB"/>
-            <Setter Property="CaretBrush" Value="#22C55E"/>
-            <Setter Property="Template">
-                <Setter.Value>
-                    <ControlTemplate TargetType="TextBox">
-                        <Border x:Name="bd" Background="#101614" BorderBrush="#22302A"
-                                BorderThickness="1" CornerRadius="8">
-                            <ScrollViewer x:Name="PART_ContentHost" Margin="2,0"/>
-                        </Border>
-                        <ControlTemplate.Triggers>
-                            <Trigger Property="IsKeyboardFocused" Value="True">
-                                <Setter TargetName="bd" Property="BorderBrush" Value="#16A34A"/>
-                                <Setter TargetName="bd" Property="Effect" Value="{StaticResource Glow}"/>
-                            </Trigger>
-                            <Trigger Property="IsEnabled" Value="False">
-                                <Setter TargetName="bd" Property="Background" Value="#0A0E0D"/>
-                            </Trigger>
-                        </ControlTemplate.Triggers>
-                    </ControlTemplate>
-                </Setter.Value>
-            </Setter>
+        <SolidColorBrush x:Key="Panel" Color="#111A15"/>
+        <Style TargetType="TextBox">
+            <Setter Property="Background" Value="#0D1510"/><Setter Property="Foreground" Value="#E7F5EB"/>
+            <Setter Property="CaretBrush" Value="#22C55E"/><Setter Property="BorderBrush" Value="#2A3A30"/>
+            <Setter Property="Padding" Value="9,7"/><Setter Property="FontSize" Value="13"/>
         </Style>
-        <Style x:Key="Combo" TargetType="ComboBox">
-            <Setter Property="Height" Value="34"/>
-            <Setter Property="FontSize" Value="13"/>
-            <Setter Property="Foreground" Value="#E7F5EB"/>
-            <Setter Property="Cursor" Value="Hand"/>
-            <Setter Property="ScrollViewer.CanContentScroll" Value="True"/>
-            <Setter Property="Template">
-                <Setter.Value>
-                    <ControlTemplate TargetType="ComboBox">
-                        <Grid>
-                            <ToggleButton x:Name="toggle" Focusable="False" ClickMode="Press"
-                                          IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"
-                                          Background="Transparent" BorderThickness="0">
-                                <ToggleButton.Template>
-                                    <ControlTemplate TargetType="ToggleButton">
-                                        <Border x:Name="bd" Background="#101614" BorderBrush="#22302A" BorderThickness="1" CornerRadius="8">
-                                            <Grid>
-                                                <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="*"/>
-                                                    <ColumnDefinition Width="26"/>
-                                                </Grid.ColumnDefinitions>
-                                                <ContentPresenter Margin="10,0,0,0" VerticalAlignment="Center" HorizontalAlignment="Left"
-                                                                  IsHitTestVisible="False"
-                                                                  Content="{Binding SelectionBoxItem, RelativeSource={RelativeSource TemplatedParent}}"
-                                                                  ContentTemplate="{Binding SelectionBoxItemTemplate, RelativeSource={RelativeSource TemplatedParent}}"/>
-                                                <Path Grid.Column="1" Data="M0,0 L4.5,4.5 L9,0" Stroke="#4A674F" StrokeThickness="1.8"
-                                                      StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"
-                                                      VerticalAlignment="Center" HorizontalAlignment="Center"/>
-                                            </Grid>
-                                        </Border>
-                                        <ControlTemplate.Triggers>
-                                            <Trigger Property="IsMouseOver" Value="True">
-                                                <Setter TargetName="bd" Property="BorderBrush" Value="#6F8B7C"/>
-                                            </Trigger>
-                                        </ControlTemplate.Triggers>
-                                    </ControlTemplate>
-                                </ToggleButton.Template>
-                            </ToggleButton>
-                            <Popup x:Name="PART_Popup" Placement="Bottom" IsOpen="{TemplateBinding IsDropDownOpen}"
-                                   AllowsTransparency="True" Focusable="False" PopupAnimation="Fade">
-                                <Border x:Name="drop" Background="#101614" BorderBrush="#22302A" BorderThickness="1" CornerRadius="10"
-                                        Margin="0,5,0,0" Padding="4" Effect="{StaticResource SoftShadow}"
-                                        MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}"
-                                        MaxHeight="{TemplateBinding MaxDropDownHeight}">
-                                    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                                        <ItemsPresenter/>
-                                    </ScrollViewer>
-                                </Border>
-                            </Popup>
-                        </Grid>
-                    </ControlTemplate>
-                </Setter.Value>
-            </Setter>
+        <Style TargetType="Button">
+            <Setter Property="Background" Value="#1A2A20"/><Setter Property="Foreground" Value="White"/>
+            <Setter Property="Padding" Value="13,8"/><Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/><Setter Property="FontWeight" Value="SemiBold"/>
         </Style>
-        <Style x:Key="ComboEdit" TargetType="ComboBox">
-            <Setter Property="Height" Value="34"/>
-            <Setter Property="FontSize" Value="13"/>
-            <Setter Property="Foreground" Value="#E7F5EB"/>
-            <Setter Property="Cursor" Value="Hand"/>
-            <Setter Property="Template">
-                <Setter.Value>
-                    <ControlTemplate TargetType="ComboBox">
-                        <Grid>
-                            <ToggleButton x:Name="toggle" Focusable="False" ClickMode="Press"
-                                          IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"
-                                          Background="Transparent" BorderThickness="0">
-                                <ToggleButton.Template>
-                                    <ControlTemplate TargetType="ToggleButton">
-                                        <Border x:Name="bd" Background="#101614" BorderBrush="#22302A" BorderThickness="1" CornerRadius="8">
-                                            <Grid>
-                                                <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="*"/>
-                                                    <ColumnDefinition Width="26"/>
-                                                </Grid.ColumnDefinitions>
-                                                <TextBox x:Name="PART_EditableTextBox" Margin="3,0,0,0" VerticalAlignment="Center"
-                                                         Background="Transparent" BorderThickness="0" Padding="7,0"
-                                                         Foreground="#E7F5EB" FontSize="13" Focusable="True" CaretBrush="#22C55E"/>
-                                                <Path Grid.Column="1" Data="M0,0 L4.5,4.5 L9,0" Stroke="#4A674F" StrokeThickness="1.8"
-                                                      StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"
-                                                      VerticalAlignment="Center" HorizontalAlignment="Center"/>
-                                            </Grid>
-                                        </Border>
-                                        <ControlTemplate.Triggers>
-                                            <Trigger Property="IsMouseOver" Value="True">
-                                                <Setter TargetName="bd" Property="BorderBrush" Value="#6F8B7C"/>
-                                            </Trigger>
-                                        </ControlTemplate.Triggers>
-                                    </ControlTemplate>
-                                </ToggleButton.Template>
-                            </ToggleButton>
-                            <Popup x:Name="PART_Popup" Placement="Bottom" IsOpen="{TemplateBinding IsDropDownOpen}"
-                                   AllowsTransparency="True" Focusable="False" PopupAnimation="Fade">
-                                <Border x:Name="drop" Background="#101614" BorderBrush="#22302A" BorderThickness="1" CornerRadius="10"
-                                        Margin="0,5,0,0" Padding="4" Effect="{StaticResource SoftShadow}"
-                                        MinWidth="{Binding ActualWidth, RelativeSource={RelativeSource TemplatedParent}}"
-                                        MaxHeight="{TemplateBinding MaxDropDownHeight}">
-                                    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                                        <ItemsPresenter/>
-                                    </ScrollViewer>
-                                </Border>
-                            </Popup>
-                        </Grid>
-                    </ControlTemplate>
-                </Setter.Value>
-            </Setter>
-        </Style>
-        <Style TargetType="ComboBoxItem">
-            <Setter Property="Padding" Value="10,6"/>
-            <Setter Property="Foreground" Value="#E7F5EB"/>
-            <Setter Property="FontSize" Value="13"/>
-            <Setter Property="Cursor" Value="Hand"/>
-            <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
-            <Setter Property="Template">
-                <Setter.Value>
-                    <ControlTemplate TargetType="ComboBoxItem">
-                        <Border x:Name="bd" Background="Transparent" CornerRadius="5" Padding="10,6">
-                            <ContentPresenter VerticalAlignment="Center"/>
-                        </Border>
-                        <ControlTemplate.Triggers>
-                            <Trigger Property="IsHighlighted" Value="True">
-                                <Setter TargetName="bd" Property="Background" Value="#12311F"/>
-                            </Trigger>
-                            <Trigger Property="IsSelected" Value="True">
-                                <Setter TargetName="bd" Property="Background" Value="#134B27"/>
-                            </Trigger>
-                        </ControlTemplate.Triggers>
-                    </ControlTemplate>
-                </Setter.Value>
-            </Setter>
-        </Style>
-        <Style x:Key="BtnPrimary" TargetType="Button">
-            <Setter Property="Background" Value="{StaticResource BtnGrad}"/>
-            <Setter Property="Foreground" Value="#FFFFFF"/>
-            <Setter Property="FontWeight" Value="SemiBold"/>
-            <Setter Property="FontSize" Value="13"/>
-           
+        <Style TargetType="CheckBox"><Setter Property="Foreground" Value="#D4E5D9"/></Style>
+    </Window.Resources>
+    <Grid Margin="18">
+        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+        <Border Grid.Row="0" Background="{StaticResource Panel}" CornerRadius="12" Padding="18,13" Margin="0,0,0,12">
+            <StackPanel><TextBlock Text="SmartSearch" FontSize="27" FontWeight="Bold"/>
+                <TextBlock Text="Search local files and safely remove byte-identical duplicates" Foreground="#91A79A" Margin="0,3,0,0"/></StackPanel>
+        </Border>
+        <Border Grid.Row="1" Background="{StaticResource Panel}" CornerRadius="12" Padding="14" Margin="0,0,0,12">
+            <Grid>
+                <Grid.ColumnDefinitions><ColumnDefinition Width="2*"/><ColumnDefinition Width="3*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                <TextBlock Grid.Row="0" Grid.Column="0" Text="Name contains" Foreground="#91A79A" Margin="0,0,8,4"/>
+                <TextBlock Grid.Row="0" Grid.Column="1" Text="Folder to search" Foreground="#91A79A" Margin="0,0,8,4"/>
+                <TextBox x:Name="txtSearch" Grid.Row="1" Grid.Column="0" Margin="0,0,10,0"/>
+                <TextBox x:Name="txtRoot" Grid.Row="1" Grid.Column="1" Margin="0,0,8,0"/>
+                <Button x:Name="btnBrowse" Grid.Row="1" Grid.Column="2" Content="Browseâ€¦" Margin="0,0,8,0"/>
+                <Button x:Name="btnSearch" Grid.Row="1" Grid.Column="3" Content="Search" Background="#16813D" MinWidth="105"/>
+                <CheckBox x:Name="chkSubfolders" Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="4" Content="Include subfolders" IsChecked="True" Margin="0,9,0,0"/>
+            </Grid>
+        </Border>
+        <Border Grid.Row="2" Background="{StaticResource Panel}" CornerRadius="12" Padding="10">
+            <ListBox x:Name="lstResults" Background="#0B110D" Foreground="#E7F5EB" BorderBrush="#26372C" BorderThickness="1" FontFamily="Consolas" FontSize="12" Padding="4"/>
+        </Border>
+        <Grid Grid.Row="3" Margin="0,12,0,0">
+            <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+            <TextBlock x:Name="lblStatus" Grid.Column="0" Text="Ready" Foreground="#91A79A" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+            <Button x:Name="btnClear" Grid.Column="1" Content="Clear results" Margin="8,0"/>
+            <Button x:Name="btnPurge" Grid.Column="2" Content="Remove exact duplicates" Background="#8B332B"/>
+        </Grid>
+    </Grid>
+</Window>
+'@
+
+    $reader = [System.Xml.XmlReader]::Create([System.IO.StringReader]::new($xaml))
+    try { $window = [Windows.Markup.XamlReader]::Load($reader) }
+    finally { $reader.Dispose() }
+
+    $txtSearch = $window.FindName('txtSearch')
+    $txtRoot = $window.FindName('txtRoot')
+    $chkSubfolders = $window.FindName('chkSubfolders')
+    $lstResults = $window.FindName('lstResults')
+    $lblStatus = $window.FindName('lblStatus')
+    $btnBrowse = $window.FindName('btnBrowse')
+    $btnSearch = $window.FindName('btnSearch')
+    $btnClear = $window.FindName('btnClear')
+    $btnPurge = $window.FindName('btnPurge')
+
+    $settings = Get-AppSettings
+    $txtSearch.Text = [string]$settings.SearchText
+    $txtRoot.Text = [string]$settings.SearchRoot
+    $chkSubfolders.IsChecked = [bool]$settings.IncludeSubfolders
+    $results = [System.Collections.Generic.List[object]]::new()
+
+    $searchAction = {
+        $root = $txtRoot.Text.Trim()
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+            [System.Windows.MessageBox]::Show('Choose an existing folder to search.', 'SmartSearch', 'OK', 'Warning') | Out-Null
+            return
+        }
+        $btnSearch.IsEnabled = $false
+        $lblStatus.Text = 'Searchingâ€¦'
+        $lstResults.Items.Clear()
+        $results.Clear()
+        try {
+            $items = Find-LocalFiles -Root $root -SearchText $txtSearch.Text `
+                -IncludeSubfolders ([bool]$chkSubfolders.IsChecked) -Exclusions @($settings.Exclusions)
+            foreach ($item in $items) {
+                $results.Add($item)
+                [void]$lstResults.Items.Add($item.Display)
+            }
+            $lblStatus.Text = "Found $($results.Count) file(s). Duplicate checks use SHA-256."
+        }
+        catch { $lblStatus.Text = "Search failed: $($_.Exception.Message)" }
+        finally { $btnSearch.IsEnabled = $true }
+    }.GetNewClosure()
+
+    $btnBrowse.Add_Click({
+        $dialog = [System.Windows.Forms.FolderBrowserDialog]::new()
+        $dialog.Description = 'Choose the folder SmartSearch should scan.'
+        $dialog.ShowNewFolderButton = $false
+        if (Test-Path -LiteralPath $txtRoot.Text -PathType Container) { $dialog.SelectedPath = $txtRoot.Text }
+        if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $txtRoot.Text = $dialog.SelectedPath }
+    }.GetNewClosure())
+
+    $btnSearch.Add_Click({ & $searchAction }.GetNewClosure())
+    $txtSearch.Add_KeyDown({ param($sender, $eventArgs) if ($eventArgs.Key -eq [System.Windows.Input.Key]::Enter) { & $searchAction } }.GetNewClosure())
+    $txtRoot.Add_KeyDown({ param($sender, $eventArgs) if ($eventArgs.Key -eq [System.Windows.Input.Key]::Enter) { & $searchAction } }.GetNewClosure())
+
+    $btnClear.Add_Click({
+        $results.Clear()
+        $lstResults.Items.Clear()
+        $lblStatus.Text = 'Results cleared.'
+    }.GetNewClosure())
+
+    $btnPurge.Add_Click({
+        if ($results.Count -lt 2) { $lblStatus.Text = 'Search for at least two files first.'; return }
+        $btnPurge.IsEnabled = $false
+        $lblStatus.Text = 'Comparing file contentsâ€¦'
+        try {
+            $duplicates = @(Get-ConfirmedDuplicateFiles -Files $results.ToArray())
+            if ($duplicates.Count -eq 0) { $lblStatus.Text = 'No byte-identical duplicates found.'; return }
+            $paths = ($duplicates | ForEach-Object { $_.FullName }) -join [Environment]::NewLine
+            $answer = [System.Windows.MessageBox]::Show(
+                "Found $($duplicates.Count) byte-identical duplicate file(s). The first copy of each file will be kept. Remove these copies?`n`n$paths",
+                'Confirm duplicate removal', 'YesNo', 'Warning')
+            if ($answer -ne [System.Windows.MessageBoxResult]::Yes) { $lblStatus.Text = 'Removal cancelled.'; return }
+
+            $removed = 0
+            foreach ($duplicate in $duplicates) {
+                try {
+                    $hash = (Get-FileHash -LiteralPath $duplicate.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
+                    $keeperExists = $false
+                    foreach ($candidate in $results) {
+                        if ($candidate.FullName -eq $duplicate.FullName) { continue }
+                        try {
+                            if ((Get-FileHash -LiteralPath $candidate.FullName -Algorithm SHA256 -ErrorAction Stop).Hash -eq $hash) {
+                                $keeperExists = $true
+                                break
+                            }
+                        }
+                        catch { }
+                    }
+                    if ($keeperExists) {
+                        Remove-Item -LiteralPath $duplicate.FullName -Force -ErrorAction Stop
+                        $removed++
+                    }
+                }
+                catch { }
+            }
+            $lblStatus.Text = "Removed $removed duplicate file(s). Search again to refresh results."
+        }
+        catch { $lblStatus.Text = "Duplicate check failed: $($_.Exception.Message)" }
+        finally { $btnPurge.IsEnabled = $true }
+    }.GetNewClosure())
+
+    $window.Add_Closing({
+        $settings.SearchRoot = $txtRoot.Text.Trim()
+        $settings.SearchText = $txtSearch.Text
+        $settings.IncludeSubfolders = [bool]$chkSubfolders.IsChecked
+        try { Save-AppSettings -Settings $settings }
+        catch { Write-Warning "Could not save SmartSearch settings: $($_.Exception.Message)" }
+    }.GetNewClosure())
+
+    [void]$window.ShowDialog()
+}
+
+try { Start-SmartSearch }
+catch {
+    $message = "SmartSearch could not start: $($_.Exception.Message)"
+    [System.Windows.MessageBox]::Show($message, 'SmartSearch', 'OK', 'Error') | Out-Null
+    Write-Error $message
+    exit 1
+}
